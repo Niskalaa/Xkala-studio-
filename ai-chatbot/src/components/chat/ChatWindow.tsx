@@ -1,20 +1,20 @@
-// src/components/chat/ChatWindow.tsx
+// src/components/chat/ChatWindow.tsx (UPDATED with DeepSeek R1)
 
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { useChat } from "ai/react";
 import { useChatStore } from "@/stores/chatStore";
 import { useAuthContext } from "@/components/providers/AuthProvider";
+import { useDeepSeekChat } from "@/hooks/useDeepSeekChat";
 import { MessageBubble } from "./MessageBubble";
 import { ChatInput } from "./ChatInput";
 import { ModelSelector } from "./ModelSelector";
 import { TypingIndicator } from "./TypingIndicator";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { getModel } from "@/lib/models";
-import { getIdToken, addMessage, updateConversation, createConversation } from "@/lib/firebase";
+import { getIdToken, createConversation } from "@/lib/firebase";
 import { generateId } from "@/lib/utils";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { AnimatePresence } from "framer-motion";
 import { Message } from "@/types";
 import { toast } from "sonner";
@@ -29,59 +29,44 @@ export function ChatWindow({ conversationId, initialMessages = [] }: ChatWindowP
   const router = useRouter();
   const scrollRef = useRef<HTMLDivElement>(null);
   const { user, firebaseUser } = useAuthContext();
-  const { 
-    currentModel, 
-    setCurrentConversation, 
+  const {
+    currentModel,
+    setCurrentConversation,
     setIsStreaming,
   } = useChatStore();
 
   const model = getModel(currentModel);
+  const isDeepSeek = currentModel === "deepseek-r1";
 
-  // Vercel AI SDK useChat hook
+  // Local state for combined message display
+  const [localMessages, setLocalMessages] = useState<Message[]>(initialMessages);
+  const [activeConversationId, setActiveConversationId] = useState<string | undefined>(conversationId);
+
+  // ============================================================
+  // STANDARD CHAT (Claude Sonnet 4 & Opus 4)
+  // ============================================================
   const {
-    messages,
-    input,
-    setInput,
-    handleSubmit,
-    isLoading,
-    stop,
-    reload,
-    error,
-    append,
+    messages: aiMessages,
+    isLoading: aiLoading,
+    stop: aiStop,
+    reload: aiReload,
+    append: aiAppend,
+    setMessages: setAiMessages,
   } = useChat({
     api: "/api/chat",
-    id: conversationId,
-    initialMessages: initialMessages.map((msg) => ({
-      id: msg.id,
-      role: msg.role as "user" | "assistant",
-      content: msg.content,
-    })),
+    id: activeConversationId,
+    initialMessages: !isDeepSeek
+      ? initialMessages.map((msg) => ({
+          id: msg.id,
+          role: msg.role as "user" | "assistant",
+          content: msg.content,
+        }))
+      : [],
     body: {
       model: currentModel,
-      conversationId,
+      conversationId: activeConversationId,
     },
-    headers: {
-      "Content-Type": "application/json",
-    },
-    onResponse: async (response) => {
-      if (!response.ok) {
-        const data = await response.json().catch(() => null);
-        toast.error(data?.error || "Failed to get AI response");
-      }
-    },
-    onFinish: async (message) => {
-      // Save to Firestore after stream completes
-      if (firebaseUser && conversationId) {
-        try {
-          await addMessage(firebaseUser.uid, conversationId, {
-            role: "assistant",
-            content: message.content,
-            model: currentModel,
-          });
-        } catch (err) {
-          console.error("Failed to save message:", err);
-        }
-      }
+    onFinish: () => {
       setIsStreaming(false);
     },
     onError: (err) => {
@@ -90,6 +75,42 @@ export function ChatWindow({ conversationId, initialMessages = [] }: ChatWindowP
     },
   });
 
+  // ============================================================
+  // DEEPSEEK R1 CHAT (with thinking)
+  // ============================================================
+  const {
+    sendMessage: deepseekSend,
+    stop: deepseekStop,
+    thinking: deepseekThinking,
+    answer: deepseekAnswer,
+    isLoading: deepseekLoading,
+    reset: deepseekReset,
+  } = useDeepSeekChat({
+    conversationId: activeConversationId,
+    onFinish: (thinking, answer) => {
+      // Add completed message to local messages
+      const assistantMsg: Message = {
+        id: generateId(),
+        conversationId: activeConversationId || "",
+        role: "assistant",
+        content: answer,
+        thinking: thinking || undefined,
+        model: "deepseek-r1",
+        isStreaming: false,
+        createdAt: new Date(),
+      };
+      setLocalMessages((prev) => [...prev, assistantMsg]);
+      setIsStreaming(false);
+    },
+    onError: (err) => {
+      toast.error("DeepSeek R1 error: " + err.message);
+      setIsStreaming(false);
+    },
+  });
+
+  // Determine which loading state to use
+  const isLoading = isDeepSeek ? deepseekLoading : aiLoading;
+
   // Update streaming state
   useEffect(() => {
     setIsStreaming(isLoading);
@@ -97,17 +118,25 @@ export function ChatWindow({ conversationId, initialMessages = [] }: ChatWindowP
 
   // Set current conversation
   useEffect(() => {
+    setActiveConversationId(conversationId);
     setCurrentConversation(conversationId || null);
   }, [conversationId, setCurrentConversation]);
 
-  // Auto-scroll to bottom
+  // Sync initial messages
+  useEffect(() => {
+    setLocalMessages(initialMessages);
+  }, [initialMessages]);
+
+  // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, isLoading]);
+  }, [aiMessages, localMessages, deepseekThinking, deepseekAnswer, isLoading]);
 
-  // Handle send message
+  // ============================================================
+  // HANDLE SEND MESSAGE
+  // ============================================================
   const handleSend = useCallback(
     async (content: string) => {
       if (!firebaseUser) {
@@ -115,127 +144,187 @@ export function ChatWindow({ conversationId, initialMessages = [] }: ChatWindowP
         return;
       }
 
-      let activeConversationId = conversationId;
+      let convId = activeConversationId;
 
-      // Create new conversation if none exists
-      if (!activeConversationId) {
+      // Create new conversation if needed
+      if (!convId) {
         try {
-          activeConversationId = await createConversation(
+          convId = await createConversation(
             firebaseUser.uid,
             currentModel,
             content.substring(0, 50)
           );
-          router.push(`/c/${activeConversationId}`);
-        } catch (err) {
+          setActiveConversationId(convId);
+          router.push(`/c/${convId}`);
+        } catch {
           toast.error("Failed to create conversation");
           return;
         }
       }
 
-      // Save user message to Firestore
-      try {
-        await addMessage(firebaseUser.uid, activeConversationId, {
-          role: "user",
-          content,
-        });
-      } catch (err) {
-        console.error("Failed to save user message:", err);
+      // Add user message to local display
+      const userMsg: Message = {
+        id: generateId(),
+        conversationId: convId,
+        role: "user",
+        content,
+        model: currentModel,
+        isStreaming: false,
+        createdAt: new Date(),
+      };
+
+      if (isDeepSeek) {
+        // DeepSeek R1 path
+        setLocalMessages((prev) => [...prev, userMsg]);
+        const previousMessages = localMessages.map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+        deepseekSend(content, previousMessages);
+      } else {
+        // Claude path (via Vercel AI SDK useChat)
+        const token = await getIdToken();
+        aiAppend(
+          { role: "user", content },
+          {
+            options: {
+              headers: { Authorization: `Bearer ${token}` },
+              body: {
+                model: currentModel,
+                conversationId: convId,
+              },
+            },
+          }
+        );
       }
-
-      // Get auth token for API
-      const token = await getIdToken();
-
-      // Send to AI via useChat
-      append(
-        {
-          role: "user",
-          content,
-        },
-        {
-          options: {
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-            body: {
-              model: currentModel,
-              conversationId: activeConversationId,
-            },
-          },
-        }
-      );
     },
-    [firebaseUser, conversationId, currentModel, append, router]
+    [
+      firebaseUser,
+      activeConversationId,
+      currentModel,
+      isDeepSeek,
+      localMessages,
+      deepseekSend,
+      aiAppend,
+      router,
+    ]
   );
 
-  // Handle regenerate
-  const handleRegenerate = useCallback(async () => {
-    const token = await getIdToken();
-    reload({
-      options: {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        body: {
-          model: currentModel,
-          conversationId,
-        },
-      },
-    });
-  }, [currentModel, conversationId, reload]);
-
-  // Show error
-  useEffect(() => {
-    if (error) {
-      toast.error("Chat error: " + error.message);
+  // ============================================================
+  // HANDLE STOP
+  // ============================================================
+  const handleStop = useCallback(() => {
+    if (isDeepSeek) {
+      deepseekStop();
+    } else {
+      aiStop();
     }
-  }, [error]);
+  }, [isDeepSeek, deepseekStop, aiStop]);
 
-  const hasMessages = messages.length > 0;
+  // ============================================================
+  // HANDLE REGENERATE
+  // ============================================================
+  const handleRegenerate = useCallback(async () => {
+    if (isDeepSeek) {
+      // Remove last assistant message and resend
+      setLocalMessages((prev) => {
+        const filtered = prev.slice(0, -1);
+        const lastUserMsg = [...filtered].reverse().find((m) => m.role === "user");
+        if (lastUserMsg) {
+          const previousMessages = filtered
+            .slice(0, -1)
+            .map((m) => ({ role: m.role, content: m.content }));
+          deepseekSend(lastUserMsg.content, previousMessages);
+        }
+        return filtered;
+      });
+    } else {
+      const token = await getIdToken();
+      aiReload({
+        options: {
+          headers: { Authorization: `Bearer ${token}` },
+          body: {
+            model: currentModel,
+            conversationId: activeConversationId,
+          },
+        },
+      });
+    }
+  }, [isDeepSeek, currentModel, activeConversationId, deepseekSend, aiReload]);
 
+  // ============================================================
+  // BUILD DISPLAY MESSAGES
+  // ============================================================
+  const displayMessages: Message[] = isDeepSeek
+    ? [
+        ...localMessages,
+        // Add streaming assistant message for DeepSeek
+        ...(deepseekLoading
+          ? [
+              {
+                id: "streaming-deepseek",
+                conversationId: activeConversationId || "",
+                role: "assistant" as const,
+                content: deepseekAnswer,
+                thinking: deepseekThinking,
+                model: "deepseek-r1" as const,
+                isStreaming: true,
+                createdAt: new Date(),
+              },
+            ]
+          : []),
+      ]
+    : aiMessages.map((msg, index) => ({
+        id: msg.id,
+        conversationId: activeConversationId || "",
+        role: msg.role as Message["role"],
+        content: msg.content,
+        model: currentModel,
+        isStreaming: aiLoading && index === aiMessages.length - 1 && msg.role === "assistant",
+        createdAt: new Date(),
+      }));
+
+  const hasMessages = displayMessages.length > 0;
+
+  // ============================================================
+  // RENDER
+  // ============================================================
   return (
     <div className="flex flex-col h-full">
-      {/* Header with Model Selector */}
-      <div className="flex items-center justify-between px-4 md:px-8 py-3 border-b">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 md:px-8 py-3 border-b bg-background/80 backdrop-blur-sm">
         <ModelSelector />
-        {conversationId && (
-          <span className="text-xs text-muted-foreground">
-            {messages.length} messages
-          </span>
-        )}
+        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          {activeConversationId && (
+            <span>{displayMessages.length} messages</span>
+          )}
+          {isDeepSeek && (
+            <span className="text-blue-500 font-medium">Reasoning Mode</span>
+          )}
+        </div>
       </div>
 
-      {/* Messages Area */}
+      {/* Messages */}
       <div className="flex-1 overflow-hidden">
         {hasMessages ? (
-          <div
-            ref={scrollRef}
-            className="h-full overflow-y-auto"
-          >
+          <div ref={scrollRef} className="h-full overflow-y-auto">
             <div className="max-w-3xl mx-auto">
-              {messages.map((msg, index) => (
+              {displayMessages.map((msg, index) => (
                 <MessageBubble
                   key={msg.id}
-                  message={{
-                    id: msg.id,
-                    conversationId: conversationId || "",
-                    role: msg.role as Message["role"],
-                    content: msg.content,
-                    model: currentModel,
-                    isStreaming:
-                      isLoading &&
-                      index === messages.length - 1 &&
-                      msg.role === "assistant",
-                    createdAt: new Date(),
-                  }}
+                  message={msg}
                   onRegenerate={
-                    msg.role === "assistant" && index === messages.length - 1
+                    msg.role === "assistant" &&
+                    index === displayMessages.length - 1 &&
+                    !isLoading
                       ? handleRegenerate
                       : undefined
                   }
                   onFeedback={(feedback) => {
-                    // TODO: Save feedback to Firestore
                     toast.success(
-                      feedback === "good" ? "Thanks for the feedback!" : "We'll improve"
+                      feedback === "good"
+                        ? "Thanks for the feedback!"
+                        : "We'll improve"
                     );
                   }}
                 />
@@ -243,12 +332,12 @@ export function ChatWindow({ conversationId, initialMessages = [] }: ChatWindowP
 
               {/* Typing indicator */}
               <AnimatePresence>
-                {isLoading && messages[messages.length - 1]?.role === "user" && (
-                  <TypingIndicator />
-                )}
+                {isLoading &&
+                  displayMessages[displayMessages.length - 1]?.role === "user" && (
+                    <TypingIndicator />
+                  )}
               </AnimatePresence>
             </div>
-            {/* Bottom spacer */}
             <div className="h-4" />
           </div>
         ) : (
@@ -256,11 +345,8 @@ export function ChatWindow({ conversationId, initialMessages = [] }: ChatWindowP
         )}
       </div>
 
-      {/* Chat Input */}
-      <ChatInput
-        onSend={handleSend}
-        onStop={stop}
-      />
+      {/* Input */}
+      <ChatInput onSend={handleSend} onStop={handleStop} />
     </div>
   );
 }
